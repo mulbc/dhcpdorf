@@ -97,11 +97,15 @@ func main() {
 	// checkErr(err, "Select failed")
 	for x, p := range rows {
 		rows[x].Active = rows[x].Active && (p.Validto.Equal(time.Date(1, time.January, 1, 0, 0, 0, 0, time.UTC)) || !(p.Validto.Before(time.Now())))
-		log.Printf("Found static lease: %v -> %v", rows[x].Mac, net.IP{134, 130, byte(rows[x].Net), byte(rows[x].Ip)})
 		currentNic, err := net.ParseMAC(rows[x].Mac)
 		if err != nil {
 			log.Printf("Found MYSQL Entry with wrong MAC format! ID: %d", rows[x].Id)
 		}
+
+		if rows[x].Ip == 0 || rows[x].Mac == "00:00:00:00:00:00" {
+			continue
+		}
+		log.Printf("Found static lease: %v -> %v", rows[x].Mac, net.IP{134, 130, byte(rows[x].Net), byte(rows[x].Ip)})
 
 		staticleases[x] = staticlease{
 			nic:    currentNic,
