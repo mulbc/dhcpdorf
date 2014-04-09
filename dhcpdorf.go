@@ -34,13 +34,14 @@ var settings struct {
 }
 
 type DHCPHandler struct {
-	ip            net.IP              // Server IP to use
-	options       dhcp.Options        // Options to send to DHCP Clients
-	start         net.IP              // Start of IP range to distribute
-	leaseRange    int                 // Number of IPs to distribute (starting from start)
-	leaseDuration time.Duration       // Lease period
-	leases        map[int]lease       // Map to keep track of leases
-	statics       map[int]staticlease // Map to keep track of static leases
+	ip             net.IP              // Server IP to use
+	allowedOptions dhcp.Options        // Options to send to DHCP Clients
+	deniedOptions  dhcp.Options        // Options to send to DHCP Clients
+	start          net.IP              // Start of IP range to distribute
+	leaseRange     int                 // Number of IPs to distribute (starting from start)
+	leaseDuration  time.Duration       // Lease period
+	leases         map[int]lease       // Map to keep track of leases
+	statics        map[int]staticlease // Map to keep track of static leases
 }
 
 type userTable struct {
@@ -76,7 +77,6 @@ func main() {
 		fmt.Println("parsing config file", err.Error())
 	}
 	db, err := sql.Open("mymysql", settings.Database+"/"+settings.User+"/"+settings.Password)
-	// checkErr(err, "mysql.Open failed")
 	if err != nil {
 		log.Fatal("Couldn't establish DB Connection!\n", err)
 		return
@@ -84,13 +84,10 @@ func main() {
 	dbmap := &gorp.DbMap{Db: db, Dialect: gorp.MySQLDialect{"MyISAM", "UTF8"}}
 	defer dbmap.Db.Close()
 	dbmap.TraceOn("[gorp]", log.New(os.Stdout, "dhcpdorf:", log.Lmicroseconds))
-	// t1 := dbmap.AddTableWithName(userTable{}, "user").SetKeys(true, "Id")
 
 	// fetch all rows
 	var rows []userTable
-	// _, err = dbmap.Select(&rows, "select `ID`, `MAC` from user")
 	_, err = dbmap.Select(&rows, "select `ID`, `Active`, `Net`, `MAC`, `IP`,`validto` from user ORDER BY `Net`, `Room` DESC")
-	// _, err = dbmap.Select(&rows, "select * from user")
 	if err != nil {
 		log.Fatal("Couldn't Select All from table!\n", err)
 		return
@@ -100,10 +97,7 @@ func main() {
 	// checkErr(err, "Select failed")
 	for x, p := range rows {
 		rows[x].Active = rows[x].Active && (p.Validto.Equal(time.Date(1, time.January, 1, 0, 0, 0, 0, time.UTC)) || !(p.Validto.Before(time.Now())))
-		// log.Printf("    %d: %v\n", x, p)
-		// log.Println("ID, Active, Net, MAC, IP")
 		log.Printf("Found static lease: %v -> %v", rows[x].Mac, net.IP{134, 130, byte(rows[x].Net), byte(rows[x].Ip)})
-		// log.Printf("Date validto: %d: %v\n", x, rows[x].isValid)
 		currentNic, err := net.ParseMAC(rows[x].Mac)
 		if err != nil {
 			log.Printf("Found MYSQL Entry with wrong MAC format! ID: %d", rows[x].Id)
@@ -125,10 +119,15 @@ func main() {
 		leaseRange:    250,
 		leases:        make(map[int]lease, 10),
 		statics:       staticleases,
-		options: dhcp.Options{
-			dhcp.OptionSubnetMask:       []byte{255, 255, 0, 0},
+		deniedOptions: dhcp.Options{
+			dhcp.OptionSubnetMask:       []byte{255, 255, 255, 0},
 			dhcp.OptionRouter:           []byte(net.IP{192, 168, 172, 2}), // Presuming Server is also your router
 			dhcp.OptionDomainNameServer: []byte(net.IP{192, 168, 172, 2}), // Presuming Server is also your DNS server
+		},
+		allowedOptions: dhcp.Options{
+			dhcp.OptionSubnetMask:       []byte{255, 255, 254, 0},
+			dhcp.OptionRouter:           []byte(net.IP{134, 130, 172, 1}), // Presuming Server is also your router
+			dhcp.OptionDomainNameServer: []byte(net.IP{134, 130, 4, 1}),   // Presuming Server is also your DNS server
 		},
 	}
 
@@ -165,10 +164,8 @@ func (h *DHCPHandler) ServeDHCP(p dhcp.Packet, msgType dhcp.MessageType, options
 	relayAgent := options[dhcp.OptionRelayAgentInformation]
 	// log.Printf("Found RelayAgent Information: %v\n", relayAgent)
 	log.Printf("Should be Port: %v/%v\n", relayAgent[6], relayAgent[7])
-	swHostname := 2 + int(relayAgent[2]) + 2 + 8 // Circuit ID header + Circuit ID + Remote ID header + string starts after 2
-	fmt.Printf("Starting with number %v\n   Circuit-ID length is %v\n", swHostname, int(relayAgent[2]))
+	swHostname := 12 // Circuit ID header + Circuit ID + Remote ID header + string starts after 2
 	log.Printf("Should be Switch: %v\n", string(relayAgent[swHostname:]))
-	// log.Printf("New Packet with Code: ", msgType)
 
 	switch msgType {
 
@@ -176,10 +173,12 @@ func (h *DHCPHandler) ServeDHCP(p dhcp.Packet, msgType dhcp.MessageType, options
 		log.Printf("DHCPDISCOVER from %v", p.CHAddr())
 		free := net.IP{0, 0, 0, 0}
 		nic := p.CHAddr()
+		options := h.deniedOptions
 		for _, v := range h.statics { // Find static lease
 			if bytes.Equal(v.nic, nic) {
 				free = v.ip
 				log.Printf("DHCPOFFER static IP Addr: %v to %v\n", free.String(), p.CHAddr().String())
+				options = h.allowedOptions
 				goto reply
 			}
 			// log.Printf("STATIC MAC %v is not MAC %v", v.nic, nic)
@@ -200,7 +199,7 @@ func (h *DHCPHandler) ServeDHCP(p dhcp.Packet, msgType dhcp.MessageType, options
 		log.Printf("DHCPOFFER NEW IP Addr: %v to %v\n", free.String(), p.CHAddr().String())
 	reply:
 		return dhcp.ReplyPacket(p, dhcp.Offer, h.ip, free, h.leaseDuration,
-			h.options.SelectOrderOrAll(options[dhcp.OptionParameterRequestList]))
+			options.SelectOrderOrAll(options[dhcp.OptionParameterRequestList]))
 
 	case dhcp.Request:
 		log.Printf("DHCPREQUEST for %v from %v", net.IP(options[dhcp.OptionRequestedIPAddress]).String(), p.CHAddr())
@@ -215,7 +214,7 @@ func (h *DHCPHandler) ServeDHCP(p dhcp.Packet, msgType dhcp.MessageType, options
 						h.leases[leaseNum] = lease{nic: p.CHAddr(), expiry: time.Now().Add(h.leaseDuration)} // reserve the IP
 						log.Printf("IP %v is granted for MAC %v\n", net.IP(options[dhcp.OptionRequestedIPAddress]).String(), p.CHAddr().String())
 						return dhcp.ReplyPacket(p, dhcp.ACK, h.ip, net.IP(options[dhcp.OptionRequestedIPAddress]), h.leaseDuration,
-							h.options.SelectOrderOrAll(options[dhcp.OptionParameterRequestList]))
+							h.deniedOptions.SelectOrderOrAll(options[dhcp.OptionParameterRequestList]))
 					}
 				}
 			} else {
@@ -223,15 +222,12 @@ func (h *DHCPHandler) ServeDHCP(p dhcp.Packet, msgType dhcp.MessageType, options
 					if v.ip.Equal(reqIP) && bytes.Equal(v.nic, p.CHAddr()) {
 						log.Printf("Granting static IP Addr: %v to %v\n", reqIP.String(), p.CHAddr().String())
 						return dhcp.ReplyPacket(p, dhcp.ACK, h.ip, net.IP(options[dhcp.OptionRequestedIPAddress]), h.leaseDuration,
-							h.options.SelectOrderOrAll(options[dhcp.OptionParameterRequestList]))
+							h.allowedOptions.SelectOrderOrAll(options[dhcp.OptionParameterRequestList]))
 					}
 				}
 			}
 		}
 		log.Printf("IP %v is NOT granted for MAC %v\n", net.IP(options[dhcp.OptionRequestedIPAddress]), p.CHAddr().String())
-		// for i, v := range options {
-		// 	log.Printf("    OPTIONS: %v -> %v : %v", i, v, string(v))
-		// }
 		return dhcp.ReplyPacket(p, dhcp.NAK, h.ip, nil, 0, nil)
 
 	case dhcp.Release, dhcp.Decline:
@@ -246,9 +242,6 @@ func (h *DHCPHandler) ServeDHCP(p dhcp.Packet, msgType dhcp.MessageType, options
 
 	case dhcp.Inform:
 		log.Printf("DHCPINFORM from MAC %v and IP %v\n", p.CHAddr().String(), p.CIAddr().String())
-		// for i, v := range options {
-		// 	log.Printf("    OPTIONS: %v -> %v : %v", i, v, string(v))
-		// }
 	}
 	return nil
 }
