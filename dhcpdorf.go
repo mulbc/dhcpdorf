@@ -167,7 +167,11 @@ func (h *DHCPHandler) ServeDHCP(p dhcp.Packet, msgType dhcp.MessageType, options
 				}
 			} else {
 				for _, v := range h.statics { // reqIP is not in dynamic range - search for static binding
-					if v.ip.Equal(reqIP) && bytes.Equal(v.nic, p.CHAddr()) && (v.port == "" || v.port == string(relayAgent[6])+"/"+string(relayAgent[7])) {
+					if v.ip.Equal(reqIP) && bytes.Equal(v.nic, p.CHAddr()) &&
+						(v.port == "" || (v.port == string(relayAgent[6])+"/"+string(relayAgent[7]) && v.switchName == string(relayAgent[swHostname:]))) {
+						if v.port == "" { // Update Port information in Database
+							// "UPDATE `user` SET `Switch`= "+string(relayAgent[swHostname:])+",`Port`= "+string(relayAgent[6])+"/"+string(relayAgent[7])+" WHERE `ID` = "+v.Id
+						}
 						log.Printf("DHCPACK Granting static IP Addr: %v to %v\n", reqIP.String(), p.CHAddr().String())
 						return dhcp.ReplyPacket(p, dhcp.ACK, h.ip, net.IP(options[dhcp.OptionRequestedIPAddress]), h.leaseDuration,
 							h.allowedOptions.SelectOrderOrAll(options[dhcp.OptionParameterRequestList]))
