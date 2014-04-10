@@ -22,9 +22,12 @@ type lease struct {
 }
 
 type staticlease struct {
-	nic    net.HardwareAddr
-	expiry time.Time
-	ip     net.IP
+	nic        net.HardwareAddr
+	expiry     time.Time
+	ip         net.IP
+	switchName string
+	port       string
+	id         int64
 }
 
 var settings struct {
@@ -43,6 +46,7 @@ type DHCPHandler struct {
 	leases         map[int]lease       // Map to keep track of leases
 	statics        map[int]staticlease // Map to keep track of static leases
 	dbmap          *gorp.DbMap
+	rows           []userTable
 }
 
 type userTable struct {
@@ -71,7 +75,7 @@ type userTable struct {
 // Example using DHCP with a single network interface device
 func main() {
 	fmt.Println("Lets get this started")
-	staticleases, dbmap := initializeStaticLeases()
+	staticleases, dbmap, rows := initializeStaticLeases()
 
 	serverIP := net.IP{134, 130, 172, 5}
 	handler := &DHCPHandler{
@@ -82,6 +86,7 @@ func main() {
 		leases:        make(map[int]lease, 10),
 		statics:       staticleases,
 		dbmap:         dbmap,
+		rows:          rows,
 		deniedOptions: dhcp.Options{
 			dhcp.OptionSubnetMask:       []byte{255, 255, 255, 0},
 			dhcp.OptionRouter:           []byte(net.IP{192, 168, 172, 2}), // Presuming Server is also your router
@@ -162,7 +167,7 @@ func (h *DHCPHandler) ServeDHCP(p dhcp.Packet, msgType dhcp.MessageType, options
 				}
 			} else {
 				for _, v := range h.statics { // reqIP is not in dynamic range - search for static binding
-					if v.ip.Equal(reqIP) && bytes.Equal(v.nic, p.CHAddr()) {
+					if v.ip.Equal(reqIP) && bytes.Equal(v.nic, p.CHAddr()) && (v.port == "" || v.port == string(relayAgent[6])+"/"+string(relayAgent[7])) {
 						log.Printf("DHCPACK Granting static IP Addr: %v to %v\n", reqIP.String(), p.CHAddr().String())
 						return dhcp.ReplyPacket(p, dhcp.ACK, h.ip, net.IP(options[dhcp.OptionRequestedIPAddress]), h.leaseDuration,
 							h.allowedOptions.SelectOrderOrAll(options[dhcp.OptionParameterRequestList]))
@@ -189,7 +194,7 @@ func (h *DHCPHandler) ServeDHCP(p dhcp.Packet, msgType dhcp.MessageType, options
 	return nil
 }
 
-func initializeStaticLeases() (map[int]staticlease, *gorp.DbMap) {
+func initializeStaticLeases() (map[int]staticlease, *gorp.DbMap, []userTable) {
 	configFile, err := os.Open("config.json")
 	if err != nil {
 		fmt.Println("opening config file", err.Error())
@@ -202,7 +207,7 @@ func initializeStaticLeases() (map[int]staticlease, *gorp.DbMap) {
 	db, err := sql.Open("mymysql", settings.Database+"/"+settings.User+"/"+settings.Password)
 	if err != nil {
 		log.Fatal("Couldn't establish DB Connection!\n", err)
-		return nil, nil
+		return nil, nil, nil
 	}
 	dbmap := &gorp.DbMap{Db: db, Dialect: gorp.MySQLDialect{"MyISAM", "UTF8"}}
 	defer dbmap.Db.Close()
@@ -213,7 +218,7 @@ func initializeStaticLeases() (map[int]staticlease, *gorp.DbMap) {
 	_, err = dbmap.Select(&rows, "SELECT `ID`, `Active`, `Net`, `MAC`, `IP`, `validto`, `Switch`, `Port` from user ORDER BY `Net`, `Room` DESC")
 	if err != nil {
 		log.Fatal("Couldn't Select All from table!\n", err)
-		return nil, nil
+		return nil, nil, nil
 	}
 	var staticleases = make(map[int]staticlease, 500)
 
@@ -230,12 +235,15 @@ func initializeStaticLeases() (map[int]staticlease, *gorp.DbMap) {
 		log.Printf("Found static lease: %v -> %v", rows[x].Mac, net.IP{134, 130, byte(rows[x].Net), byte(rows[x].Ip)})
 
 		staticleases[x] = staticlease{
-			nic:    currentNic,
-			expiry: time.Now().Add(time.Hour),
-			ip:     net.IP{134, 130, byte(rows[x].Net), byte(rows[x].Ip)},
+			nic:        currentNic,
+			expiry:     time.Now().Add(time.Hour),
+			ip:         net.IP{134, 130, byte(rows[x].Net), byte(rows[x].Ip)},
+			switchName: rows[x].Switch,
+			port:       rows[x].Port,
+			id:         rows[x].Id,
 		}
 	}
-	return staticleases, dbmap
+	return staticleases, dbmap, rows
 }
 
 func (h *DHCPHandler) giveOutIP(p dhcp.Packet) (net.IP, dhcp.Options) {
