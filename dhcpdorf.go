@@ -42,6 +42,7 @@ type DHCPHandler struct {
 	leaseDuration  time.Duration       // Lease period
 	leases         map[int]lease       // Map to keep track of leases
 	statics        map[int]staticlease // Map to keep track of static leases
+	dbmap          *gorp.DbMap
 }
 
 type userTable struct {
@@ -61,60 +62,17 @@ type userTable struct {
 	Validto    time.Time `db:"validto"`
 	Acclevel   string    `db:"acclevel"`
 	Comment    string    `db:"comment"`
+	Switch     string
+	Port       string
 	LastEdit   time.Time `db:lastEdit`
 	Version    int32
 }
 
 // Example using DHCP with a single network interface device
 func main() {
-	configFile, err := os.Open("config.json")
-	if err != nil {
-		fmt.Println("opening config file", err.Error())
-	}
-
-	jsonParser := json.NewDecoder(configFile)
-	if err = jsonParser.Decode(&settings); err != nil {
-		fmt.Println("parsing config file", err.Error())
-	}
-	db, err := sql.Open("mymysql", settings.Database+"/"+settings.User+"/"+settings.Password)
-	if err != nil {
-		log.Fatal("Couldn't establish DB Connection!\n", err)
-		return
-	}
-	dbmap := &gorp.DbMap{Db: db, Dialect: gorp.MySQLDialect{"MyISAM", "UTF8"}}
-	defer dbmap.Db.Close()
-	dbmap.TraceOn("[gorp]", log.New(os.Stdout, "dhcpdorf:", log.Lmicroseconds))
-
-	// fetch all rows
-	var rows []userTable
-	_, err = dbmap.Select(&rows, "select `ID`, `Active`, `Net`, `MAC`, `IP`,`validto` from user ORDER BY `Net`, `Room` DESC")
-	if err != nil {
-		log.Fatal("Couldn't Select All from table!\n", err)
-		return
-	}
-	var staticleases = make(map[int]staticlease, 500)
-
-	// checkErr(err, "Select failed")
-	for x, p := range rows {
-		rows[x].Active = rows[x].Active && (p.Validto.Equal(time.Date(1, time.January, 1, 0, 0, 0, 0, time.UTC)) || !(p.Validto.Before(time.Now())))
-		currentNic, err := net.ParseMAC(rows[x].Mac)
-		if err != nil {
-			log.Printf("Found MYSQL Entry with wrong MAC format! ID: %d", rows[x].Id)
-		}
-
-		if rows[x].Ip == 0 || rows[x].Mac == "00:00:00:00:00:00" {
-			continue
-		}
-		log.Printf("Found static lease: %v -> %v", rows[x].Mac, net.IP{134, 130, byte(rows[x].Net), byte(rows[x].Ip)})
-
-		staticleases[x] = staticlease{
-			nic:    currentNic,
-			expiry: time.Now().Add(time.Hour),
-			ip:     net.IP{134, 130, byte(rows[x].Net), byte(rows[x].Ip)},
-		}
-	}
-
 	fmt.Println("Lets get this started")
+	staticleases, dbmap := initializeStaticLeases()
+
 	serverIP := net.IP{134, 130, 172, 5}
 	handler := &DHCPHandler{
 		ip:            serverIP,
@@ -123,6 +81,7 @@ func main() {
 		leaseRange:    250,
 		leases:        make(map[int]lease, 10),
 		statics:       staticleases,
+		dbmap:         dbmap,
 		deniedOptions: dhcp.Options{
 			dhcp.OptionSubnetMask:       []byte{255, 255, 255, 0},
 			dhcp.OptionRouter:           []byte(net.IP{192, 168, 172, 2}), // Presuming Server is also your router
@@ -175,33 +134,13 @@ func (h *DHCPHandler) ServeDHCP(p dhcp.Packet, msgType dhcp.MessageType, options
 
 	case dhcp.Discover:
 		log.Printf("DHCPDISCOVER from %v", p.CHAddr())
-		free := net.IP{0, 0, 0, 0}
-		nic := p.CHAddr()
-		options := h.deniedOptions
-		for _, v := range h.statics { // Find static lease
-			if bytes.Equal(v.nic, nic) {
-				free = v.ip
-				log.Printf("DHCPOFFER static IP Addr: %v to %v\n", free.String(), p.CHAddr().String())
-				options = h.allowedOptions
-				goto reply
-			}
-			// log.Printf("STATIC MAC %v is not MAC %v", v.nic, nic)
+
+		free, options := h.giveOutIP(p)
+
+		if free == nil {
+			return nil
 		}
-		for i, v := range h.leases { // Find previous lease
-			if bytes.Equal(v.nic, nic) {
-				free = dhcp.IPAdd(h.start, i)
-				log.Printf("DHCPOFFER OLD IP Addr: %v to %v\n", free.String(), p.CHAddr().String())
-				goto reply
-			}
-			// log.Printf("DYNAMIC MAC %v is not MAC %v", v.nic.String(), nic.String())
-		}
-		free = h.freeLease()
-		if free.Equal(net.IP{0, 0, 0, 0}) {
-			log.Printf("No more free IPs for host %v available :(\n", p.CHAddr().String())
-			return
-		}
-		log.Printf("DHCPOFFER NEW IP Addr: %v to %v\n", free.String(), p.CHAddr().String())
-	reply:
+
 		return dhcp.ReplyPacket(p, dhcp.Offer, h.ip, free, h.leaseDuration,
 			options.SelectOrderOrAll(options[dhcp.OptionParameterRequestList]))
 
@@ -216,29 +155,29 @@ func (h *DHCPHandler) ServeDHCP(p dhcp.Packet, msgType dhcp.MessageType, options
 				if leaseNum := dhcp.IPRange(h.start, reqIP) - 1; leaseNum >= 0 && leaseNum < h.leaseRange { // allow if reqIP is in our range
 					if l, exists := h.leases[leaseNum]; !exists || bytes.Equal(l.nic, p.CHAddr()) { // allow if reqIP doesn't exist yet or MAC is the same
 						h.leases[leaseNum] = lease{nic: p.CHAddr(), expiry: time.Now().Add(h.leaseDuration)} // reserve the IP
-						log.Printf("IP %v is granted for MAC %v\n", net.IP(options[dhcp.OptionRequestedIPAddress]).String(), p.CHAddr().String())
+						log.Printf("DHCPACK IP %v is granted for MAC %v\n", net.IP(options[dhcp.OptionRequestedIPAddress]).String(), p.CHAddr().String())
 						return dhcp.ReplyPacket(p, dhcp.ACK, h.ip, net.IP(options[dhcp.OptionRequestedIPAddress]), h.leaseDuration,
 							h.deniedOptions.SelectOrderOrAll(options[dhcp.OptionParameterRequestList]))
 					}
 				}
 			} else {
-				for _, v := range h.statics { // Find static lease
+				for _, v := range h.statics { // reqIP is not in dynamic range - search for static binding
 					if v.ip.Equal(reqIP) && bytes.Equal(v.nic, p.CHAddr()) {
-						log.Printf("Granting static IP Addr: %v to %v\n", reqIP.String(), p.CHAddr().String())
+						log.Printf("DHCPACK Granting static IP Addr: %v to %v\n", reqIP.String(), p.CHAddr().String())
 						return dhcp.ReplyPacket(p, dhcp.ACK, h.ip, net.IP(options[dhcp.OptionRequestedIPAddress]), h.leaseDuration,
 							h.allowedOptions.SelectOrderOrAll(options[dhcp.OptionParameterRequestList]))
 					}
 				}
 			}
 		}
-		log.Printf("IP %v is NOT granted for MAC %v\n", net.IP(options[dhcp.OptionRequestedIPAddress]), p.CHAddr().String())
+		log.Printf("DHCPNACK IP %v is NOT granted for MAC %v\n", net.IP(options[dhcp.OptionRequestedIPAddress]), p.CHAddr().String())
 		return dhcp.ReplyPacket(p, dhcp.NAK, h.ip, nil, 0, nil)
 
 	case dhcp.Release, dhcp.Decline:
 		nic := p.CHAddr()
 		for i, v := range h.leases {
 			if bytes.Equal(v.nic, nic) {
-				fmt.Printf("Releasing address %v for MAC %v\n", i, nic)
+				log.Printf("DHCPRELEASE Releasing address %v for MAC %v\n", i, nic)
 				delete(h.leases, i)
 				break
 			}
@@ -248,6 +187,91 @@ func (h *DHCPHandler) ServeDHCP(p dhcp.Packet, msgType dhcp.MessageType, options
 		log.Printf("DHCPINFORM from MAC %v and IP %v\n", p.CHAddr().String(), p.CIAddr().String())
 	}
 	return nil
+}
+
+func initializeStaticLeases() (map[int]staticlease, *gorp.DbMap) {
+	configFile, err := os.Open("config.json")
+	if err != nil {
+		fmt.Println("opening config file", err.Error())
+	}
+
+	jsonParser := json.NewDecoder(configFile)
+	if err = jsonParser.Decode(&settings); err != nil {
+		fmt.Println("parsing config file", err.Error())
+	}
+	db, err := sql.Open("mymysql", settings.Database+"/"+settings.User+"/"+settings.Password)
+	if err != nil {
+		log.Fatal("Couldn't establish DB Connection!\n", err)
+		return nil, nil
+	}
+	dbmap := &gorp.DbMap{Db: db, Dialect: gorp.MySQLDialect{"MyISAM", "UTF8"}}
+	defer dbmap.Db.Close()
+	dbmap.TraceOn("[gorp]", log.New(os.Stdout, "dhcpdorf:", log.Lmicroseconds))
+
+	// fetch all rows
+	var rows []userTable
+	_, err = dbmap.Select(&rows, "SELECT `ID`, `Active`, `Net`, `MAC`, `IP`, `validto`, `Switch`, `Port` from user ORDER BY `Net`, `Room` DESC")
+	if err != nil {
+		log.Fatal("Couldn't Select All from table!\n", err)
+		return nil, nil
+	}
+	var staticleases = make(map[int]staticlease, 500)
+
+	for x, p := range rows {
+		rows[x].Active = rows[x].Active && (p.Validto.Equal(time.Date(1, time.January, 1, 0, 0, 0, 0, time.UTC)) || !(p.Validto.Before(time.Now())))
+		currentNic, err := net.ParseMAC(rows[x].Mac)
+		if err != nil {
+			log.Fatalf("Found MYSQL Entry with wrong MAC format! ID: %d", rows[x].Id)
+		}
+
+		if rows[x].Ip == 0 || rows[x].Mac == "00:00:00:00:00:00" {
+			continue
+		}
+		log.Printf("Found static lease: %v -> %v", rows[x].Mac, net.IP{134, 130, byte(rows[x].Net), byte(rows[x].Ip)})
+
+		staticleases[x] = staticlease{
+			nic:    currentNic,
+			expiry: time.Now().Add(time.Hour),
+			ip:     net.IP{134, 130, byte(rows[x].Net), byte(rows[x].Ip)},
+		}
+	}
+	return staticleases, dbmap
+}
+
+func (h *DHCPHandler) giveOutIP(p dhcp.Packet) (net.IP, dhcp.Options) {
+	free := net.IP{0, 0, 0, 0}
+	nic := p.CHAddr()
+
+	for _, v := range h.statics {
+		// Check for static binding
+		if bytes.Equal(v.nic, nic) {
+			free = v.ip
+			log.Printf("DHCPOFFER static IP Addr: %v to %v\n", free.String(), p.CHAddr().String())
+			return v.ip, h.allowedOptions
+		}
+	}
+
+	if free.Equal(net.IP{0, 0, 0, 0}) {
+		// Check for previous dynamic lease
+		for i, v := range h.leases {
+			if bytes.Equal(v.nic, nic) {
+				free = dhcp.IPAdd(h.start, i)
+				log.Printf("DHCPOFFER OLD IP Addr: %v to %v\n", free.String(), p.CHAddr().String())
+				return free, h.deniedOptions
+			}
+		}
+	}
+
+	if free.Equal(net.IP{0, 0, 0, 0}) {
+		// Create new dynamic lease for client
+		free = h.freeLease()
+	}
+	if free.Equal(net.IP{0, 0, 0, 0}) {
+		log.Fatalf("No more free IPs for host %v available :(\n", p.CHAddr().String())
+		return nil, nil
+	}
+	log.Printf("DHCPOFFER NEW IP Addr: %v to %v\n", free.String(), p.CHAddr().String())
+	return free, h.deniedOptions
 }
 
 func (h *DHCPHandler) freeLease() net.IP {
@@ -261,10 +285,4 @@ func (h *DHCPHandler) freeLease() net.IP {
 		}
 	}
 	return net.IP{0, 0, 0, 0}
-}
-
-func checkErr(err error, msg string) {
-	if err != nil {
-		log.Fatalln(msg, err)
-	}
 }
